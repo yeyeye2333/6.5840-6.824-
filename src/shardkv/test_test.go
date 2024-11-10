@@ -1,21 +1,25 @@
 package shardkv
 
-import "6.5840/porcupine"
-import "6.5840/models"
-import "testing"
-import "strconv"
-import "time"
-import "fmt"
-import "sync/atomic"
-import "sync"
-import "math/rand"
-import "io/ioutil"
+import (
+	"fmt"
+	"io/ioutil"
+	"math/rand"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"6.5840/models"
+	"6.5840/porcupine"
+)
 
 const linearizabilityCheckTimeout = 1 * time.Second
 
 func check(t *testing.T, ck *Clerk, key string, value string) {
 	v := ck.Get(key)
 	if v != value {
+		fmt.Println("错误!!!!!!!!!!!!!!!!!!!!!!!!11")
 		t.Fatalf("Get(%v): expected:\n%v\nreceived:\n%v", key, value, v)
 	}
 }
@@ -141,6 +145,7 @@ func TestRejection5A(t *testing.T) {
 					// if v is "", it probably means that a k/v group
 					// returned a value for a key even though that
 					// key's shard wasn't assigned to to the group.
+					fmt.Println("here", ka[i], va[i])
 					ch <- fmt.Sprintf("Get(%v): returned a value, but server should have rejected the request due to wrong shard", ka[i])
 				} else {
 					ch <- fmt.Sprintf("Get(%v): expected:\n%v\nreceived:\n%v", ka[i], va[i], v)
@@ -548,6 +553,7 @@ func TestConcurrent3_5B(t *testing.T) {
 		ka[i] = strconv.Itoa(i)
 		va[i] = randstring(1)
 		ck.Put(ka[i], va[i])
+		check(t, ck, ka[i], va[i])
 	}
 
 	var done int32
@@ -559,6 +565,7 @@ func TestConcurrent3_5B(t *testing.T) {
 			x := randstring(1)
 			ck1.Append(ka[i], x)
 			va[i] += x
+			check(t, ck, ka[i], va[i])
 		}
 	}
 

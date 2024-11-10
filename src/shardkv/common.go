@@ -14,6 +14,7 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrTimeOut     = "ErrTimeOut"
 )
 
 type Err string
@@ -27,6 +28,10 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Cli_ID     int64
+	Command_ID uint32
+
+	Config_Num int
 }
 
 type PutAppendReply struct {
@@ -36,6 +41,10 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	Cli_ID     int64
+	Command_ID uint32
+
+	Config_Num int
 }
 
 type GetReply struct {

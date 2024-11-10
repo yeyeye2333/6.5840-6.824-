@@ -1,12 +1,16 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
+	"bytes"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
 const Debug = false
@@ -18,11 +22,36 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const max_command_time = time.Millisecond * 100
+
+type rf_index = uint32
+type rf_term = uint32
+
+type oprate = int
+
+const (
+	get_type oprate = iota
+	put_type
+	append_type
+)
+
+type rpc_ret = int
+
+const (
+	complete rpc_ret = iota
+	not_leader
+	time_out
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type       oprate
+	Key        string
+	Val        string
+	Cli_ID     int64
+	Command_ID rf_index
 }
 
 type KVServer struct {
@@ -35,19 +64,153 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister  *raft.Persister
+	kvs        map[string]string
+	commit_map map[rf_index]chan rf_term
+	cli_map    map[int64]rf_index
 }
 
+func (kv *KVServer) real_deal() {
+	for !kv.killed() {
+		apply := <-kv.applyCh
+		kv.mu.Lock()
+		if apply.CommandValid {
+			op := apply.Command.(Op)
+			if v, ok := kv.cli_map[op.Cli_ID]; !ok || v != op.Command_ID {
+				switch op.Type {
+				case get_type:
+				case put_type:
+					kv.kvs[op.Key] = op.Val
+					kv.cli_map[op.Cli_ID] = op.Command_ID
+				case append_type:
+					if v, ok := kv.kvs[op.Key]; ok {
+						kv.kvs[op.Key] = v + op.Val
+					} else {
+						kv.kvs[op.Key] = op.Val
+					}
+					kv.cli_map[op.Cli_ID] = op.Command_ID
+				}
+				if kv.maxraftstate > 0 && kv.maxraftstate < kv.persister.RaftStateSize() {
+					w1 := new(bytes.Buffer)
+					e1 := labgob.NewEncoder(w1)
+					e1.Encode(kv.kvs)
+					e1.Encode(kv.cli_map)
+					snapshot := w1.Bytes()
+					kv.rf.Snapshot(apply.CommandIndex, snapshot)
+				}
+			}
+			if v, ok := kv.commit_map[uint32(apply.CommandIndex)]; ok {
+				v <- apply.CommandTerm
+			}
+		} else if apply.SnapshotValid {
+			r := bytes.NewBuffer(apply.Snapshot)
+			d := labgob.NewDecoder(r)
+			var kvs map[string]string
+			var cli_map map[int64]uint32
+			if err1 := d.Decode(&kvs); err1 != nil ||
+				d.Decode(&cli_map) != nil {
+				fmt.Println("快照读取失败", err1)
+			} else {
+				kv.cli_map = cli_map
+				kv.kvs = kvs
+			}
+		}
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) command_start(op Op) rpc_ret {
+	kv.mu.Lock()
+	if v, ok := kv.cli_map[op.Cli_ID]; ok {
+		if v >= op.Command_ID && op.Type != get_type {
+			kv.mu.Unlock()
+			return complete
+		}
+	}
+	kv.mu.Unlock()
+
+	index, term, isleader := kv.rf.Start(op)
+	if !isleader {
+		return not_leader
+	}
+
+	ch := make(chan rf_term, 1)
+	kv.mu.Lock() //可能晚于deal,无碍
+	kv.commit_map[uint32(index)] = ch
+	kv.mu.Unlock()
+
+	select {
+	case commit_term := <-ch:
+		if commit_term == uint32(term) {
+			kv.mu.Lock()
+			delete(kv.commit_map, uint32(index)) //不考虑已有index（短时间连续成为leader）
+			kv.mu.Unlock()
+			return complete
+		}
+	case <-time.After(max_command_time):
+	}
+	kv.mu.Lock()
+	delete(kv.commit_map, uint32(index))
+	kv.mu.Unlock()
+	return time_out
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	if kv.killed() {
+		return
+	}
+
+	op := Op{Type: get_type, Key: args.Key, Cli_ID: args.Cli_ID, Command_ID: args.Command_ID}
+	switch kv.command_start(op) {
+	case complete:
+		reply.Error = ""
+		kv.mu.Lock()
+		if v, ok := kv.kvs[args.Key]; ok {
+			reply.Value = v
+		}
+		kv.mu.Unlock()
+	case not_leader:
+		reply.Error = "not leader"
+	case time_out:
+		reply.Error = "time out"
+	}
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	if kv.killed() {
+		return
+	}
+
+	op := Op{Type: put_type, Key: args.Key, Val: args.Value, Cli_ID: args.Cli_ID, Command_ID: args.Command_ID}
+	switch kv.command_start(op) {
+	case complete:
+		reply.Error = ""
+	case not_leader:
+		reply.Error = "not leader"
+	case time_out:
+		reply.Error = "time out"
+	}
+	// println("Err is", reply.Err)
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	if kv.killed() {
+		return
+	}
+
+	op := Op{Type: append_type, Key: args.Key, Val: args.Value, Cli_ID: args.Cli_ID, Command_ID: args.Command_ID}
+	switch kv.command_start(op) {
+	case complete:
+		reply.Error = ""
+	case not_leader:
+		reply.Error = "not leader"
+	case time_out:
+		reply.Error = "time out"
+	}
+	// println("Err is", reply.Err)
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -96,6 +259,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.kvs = make(map[string]string, 10)
+	kv.commit_map = make(map[rf_index]chan rf_term, 10)
+	kv.cli_map = make(map[int64]rf_index, 10)
+	kv.persister = persister
+	go kv.real_deal()
 
 	return kv
 }
